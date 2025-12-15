@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState } from "react";
 import jsQR from "jsqr";
+import Tesseract from "tesseract.js";
 
 interface QRScannerProps {
   onSerialFound: (serialNumber: string) => void;
@@ -9,15 +10,68 @@ interface QRScannerProps {
 const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const ocrWorkerRef = useRef<Tesseract.Worker | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [manualSerial, setManualSerial] = useState("");
   const [scanCount, setScanCount] = useState(0);
+  const [ocrAttempts, setOcrAttempts] = useState(0);
+  const [isOcrReady, setIsOcrReady] = useState(false);
+  const enableOCR = false;
+
+  // Initialize OCR worker when component mounts
+  useEffect(() => {
+    const initOCR = async () => {
+      try {
+        ocrWorkerRef.current = await Tesseract.createWorker("eng");
+        await ocrWorkerRef.current.setParameters({
+          tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+          tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK,
+        });
+        setIsOcrReady(true);
+      } catch (error) {
+        console.warn("OCR initialization failed:", error);
+      }
+    };
+
+    initOCR();
+
+    // Cleanup OCR worker on unmount
+    return () => {
+      if (ocrWorkerRef.current) {
+        ocrWorkerRef.current.terminate();
+      }
+    };
+  }, []);
+
+  // OCR fallback function
+  const tryOCR = async (canvas: HTMLCanvasElement) => {
+    if (!enableOCR || !ocrWorkerRef.current || !isOcrReady) return false;
+
+    try {
+      setOcrAttempts((prev) => prev + 1);
+
+      const {
+        data: { text },
+      } = await ocrWorkerRef.current.recognize(canvas);
+      const serial = formatSerial(text);
+
+      if (serial) {
+        onSerialFound(serial);
+        setIsScanning(false);
+        return true;
+      }
+    } catch (error) {
+      console.warn("OCR processing failed:", error);
+    }
+
+    return false;
+  };
 
   // Simple continuous scanning loop
   useEffect(() => {
     if (!isScanning) return;
 
-    const scan = () => {
+    const scan = async () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
 
@@ -39,25 +93,31 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
           const detector = new (window as any).BarcodeDetector({
             formats: ["qr_code"],
           });
-          detector
-            .detect(canvas)
-            .then((codes: any[]) => {
-              if (codes.length > 0) {
-                onSerialFound(extractSerial(codes[0].rawValue));
-                setIsScanning(false);
-                return;
-              }
-            })
-            .catch(() => {});
+          try {
+            const codes = await detector.detect(canvas);
+            if (codes.length > 0) {
+              onSerialFound(formatSerial(codes[0].rawValue));
+              setIsScanning(false);
+              return;
+            }
+          } catch (e) {
+            // Silent fallback to jsQR
+          }
         }
 
         // Fallback to jsQR
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const code = jsQR(imageData.data, imageData.width, imageData.height);
         if (code) {
-          onSerialFound(extractSerial(code.data));
+          onSerialFound(formatSerial(code.data));
           setIsScanning(false);
           return;
+        }
+
+        // OCR fallback - try every 30 frames (about once per second at 30fps)
+        if (isOcrReady && scanCount > 60 && scanCount % 30 === 0) {
+          const ocrSuccess = await tryOCR(canvas);
+          if (ocrSuccess) return;
         }
       } catch (err) {
         console.error("Scan error:", err);
@@ -67,13 +127,10 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
     };
 
     requestAnimationFrame(scan);
-  }, [isScanning, onSerialFound]);
+  }, [isScanning, onSerialFound, scanCount, isOcrReady]);
 
-  const extractSerial = (qrData: string): string => {
-    const match = qrData.match(
-      /(?:serial[:\s]*|sn[:\s]*|id[:\s]*)([A-Z0-9\-]+)/i,
-    );
-    return match ? match[1].toUpperCase() : qrData.toUpperCase();
+  const formatSerial = (qrData: string): string => {
+    return qrData.trim().toUpperCase();
   };
 
   const startCamera = async () => {
@@ -87,6 +144,7 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
         await videoRef.current.play();
         setIsScanning(true);
         setScanCount(0);
+        setOcrAttempts(0);
       }
     } catch (err) {
       onError?.(`Camera access failed: ${err}`);
@@ -96,6 +154,7 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
   const stopCamera = () => {
     setIsScanning(false);
     setScanCount(0);
+    setOcrAttempts(0);
     if (videoRef.current?.srcObject) {
       (videoRef.current.srcObject as MediaStream)
         .getTracks()
@@ -106,8 +165,8 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
 
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (manualSerial.trim()) {
-      onSerialFound(manualSerial.trim().toUpperCase());
+    if (formatSerial(manualSerial)) {
+      onSerialFound(formatSerial(manualSerial));
       setManualSerial("");
     }
   };
@@ -173,9 +232,12 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
                 padding: "4px 8px",
                 borderRadius: "4px",
                 fontSize: "12px",
+                display: "flex",
+                gap: "8px",
               }}
             >
-              Frames: {scanCount}
+              <span>Frames: {scanCount}</span>
+              {ocrAttempts > 0 && <span>OCR: {ocrAttempts}</span>}
             </div>
           </>
         )}
@@ -262,21 +324,21 @@ const QRScanner: React.FC<QRScannerProps> = ({ onSerialFound, onError }) => {
       </div>
 
       {/* Browser support note */}
-      {!("BarcodeDetector" in window) && (
-        <div
-          style={{
-            padding: "8px 12px",
-            backgroundColor: "#e3f2fd",
-            borderRadius: "6px",
-            fontSize: "12px",
-            color: "#1976d2",
-            textAlign: "center",
-            maxWidth: "400px",
-          }}
-        >
-          📱 Using fallback QR scanner for better compatibility
-        </div>
-      )}
+      <div
+        style={{
+          padding: "8px 12px",
+          backgroundColor: "#e3f2fd",
+          borderRadius: "6px",
+          fontSize: "12px",
+          color: "#1976d2",
+          textAlign: "center",
+          maxWidth: "400px",
+        }}
+      >
+        {!("BarcodeDetector" in window)
+          ? "📱 Using fallback QR scanner + OCR for better compatibility"
+          : `🔍 QR scanner with OCR fallback ${isOcrReady ? "ready" : "loading..."}`}
+      </div>
     </div>
   );
 };
